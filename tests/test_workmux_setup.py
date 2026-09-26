@@ -251,15 +251,9 @@ class TestSetupInstall:
             / "plugins"
             / "workmux-status.ts"
         ).read_text()
-        registration = """  try {
-    await $`workmux register-agent`.quiet();
-  } catch {
-    // Status tracking remains available when registration cannot reach workmux.
-  }
-
-"""
+        plugin_id = "  id: 'workmux-status',\n"
         (plugin_dir / "workmux-status.ts").write_text(
-            bundled_plugin.replace(registration, "")
+            bundled_plugin.replace(plugin_id, "")
         )
 
         run_setup_with_answers(
@@ -268,9 +262,7 @@ class TestSetupInstall:
             expected_output=("workmux register-agent",),
         )
 
-        assert (
-            "workmux register-agent" in (plugin_dir / "workmux-status.ts").read_text()
-        )
+        assert "id: 'workmux-status'" in (plugin_dir / "workmux-status.ts").read_text()
 
     def test_claude_install_accept(
         self,

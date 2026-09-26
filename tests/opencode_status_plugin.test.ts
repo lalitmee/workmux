@@ -1,34 +1,74 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 
 import { WorkmuxStatusPlugin } from '../resources/opencode/plugins/workmux-status';
+
+class EventQueue {
+  private values: unknown[] = [];
+  private waiters: Array<(result: IteratorResult<unknown>) => void> = [];
+
+  push(value: unknown) {
+    const waiter = this.waiters.shift();
+    if (waiter) waiter({ value, done: false });
+    else this.values.push(value);
+  }
+
+  subscribe(signal: AbortSignal): AsyncIterable<unknown> {
+    return {
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          if (signal.aborted) return Promise.resolve({ value: undefined, done: true });
+          const value = this.values.shift();
+          if (value !== undefined) return Promise.resolve({ value, done: false });
+          return new Promise<IteratorResult<unknown>>((resolve) => {
+            const onAbort = () => resolve({ value: undefined, done: true });
+            signal.addEventListener('abort', onAbort, { once: true });
+            this.waiters.push((result) => {
+              signal.removeEventListener('abort', onAbort);
+              resolve(result);
+            });
+          });
+        },
+      }),
+    };
+  }
+}
+
+const cleanups: Array<() => Promise<void>> = [];
+
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0)) await cleanup();
+});
 
 async function createHarness({ failRegistration = false } = {}) {
   const statuses: string[] = [];
   const commands: string[] = [];
-  const shell = (strings: TemplateStringsArray, status?: string) => {
-    const command = strings.reduce(
-      (result, part, index) => result + part + (index < strings.length - 1 ? status : ''),
-      '',
-    );
-    return {
-      quiet: async () => {
-        commands.push(command);
-        if (command === 'workmux register-agent' && failRegistration) {
-          throw new Error('registration failed');
-        }
-        if (status !== undefined) {
-          statuses.push(status);
-        }
-      },
-    };
-  };
-  const hooks = await WorkmuxStatusPlugin({ $: shell } as never);
+  const queue = new EventQueue();
+  const originalSpawn = Bun.spawn;
+  Bun.spawn = ((args: string[]) => {
+    const command = args.join(' ');
+    commands.push(command);
+    if (command === 'workmux register-agent' && failRegistration) {
+      return { exited: Promise.reject(new Error('registration failed')) } as never;
+    }
+    const status = args[2];
+    if (status !== undefined) statuses.push(status);
+    return { exited: Promise.resolve(0) } as never;
+  }) as never;
+  const cleanup = await WorkmuxStatusPlugin.setup({
+    event: { subscribe: ({ signal }: { signal: AbortSignal }) => queue.subscribe(signal) },
+  } as never);
+  cleanups.push(async () => {
+    cleanup?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    Bun.spawn = originalSpawn;
+  });
 
   return {
     commands,
     statuses,
     emit: async (event: unknown) => {
-      await hooks.event?.({ event } as never);
+      queue.push(event);
+      await new Promise((resolve) => setTimeout(resolve, 0));
     },
   };
 }
@@ -44,25 +84,35 @@ const userMessage = (sessionID: string) => ({
 });
 
 describe('WorkmuxStatusPlugin', () => {
+  test('exports a stable V2 plugin definition', () => {
+    expect(WorkmuxStatusPlugin.id).toBe('workmux-status');
+    expect(typeof WorkmuxStatusPlugin.setup).toBe('function');
+  });
+
   test('awaits registration during initialization before status handling', async () => {
     let finishRegistration!: () => void;
     const registration = new Promise<void>((resolve) => {
       finishRegistration = resolve;
     });
     let initialized = false;
-    const shell = () => ({ quiet: () => registration });
-
-    const initialization = WorkmuxStatusPlugin({ $: shell } as never).then((hooks) => {
+    const originalSpawn = Bun.spawn;
+    Bun.spawn = (() => ({ exited: registration })) as never;
+    const initialization = WorkmuxStatusPlugin.setup({
+      event: { subscribe: () => new EventQueue().subscribe(new AbortController().signal) },
+    } as never).then((cleanup) => {
       initialized = true;
-      return hooks;
+      cleanups.push(async () => {
+        cleanup?.();
+        Bun.spawn = originalSpawn;
+      });
+      return cleanup;
     });
     await Promise.resolve();
     expect(initialized).toBe(false);
 
     finishRegistration();
-    const hooks = await initialization;
+    await initialization;
     expect(initialized).toBe(true);
-    expect(hooks.event).toBeDefined();
   });
 
   test('registers before reporting status', async () => {
@@ -86,40 +136,73 @@ describe('WorkmuxStatusPlugin', () => {
     expect(harness.statuses).toEqual(['working']);
   });
 
+  test('continues consuming events when starting a status command throws', async () => {
+    const originalSpawn = Bun.spawn;
+    let failFirstStatus = true;
+    const statuses: string[] = [];
+    Bun.spawn = ((args: string[]) => {
+      if (args[1] === 'register-agent') return { exited: Promise.resolve(0) } as never;
+      if (failFirstStatus) {
+        failFirstStatus = false;
+        throw new Error('workmux executable unavailable');
+      }
+      statuses.push(args[2]);
+      return { exited: Promise.resolve(0) } as never;
+    }) as never;
+    const queue = new EventQueue();
+    const cleanup = await WorkmuxStatusPlugin.setup({
+      event: { subscribe: ({ signal }: { signal: AbortSignal }) => queue.subscribe(signal) },
+    } as never);
+    cleanups.push(async () => {
+      cleanup?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      Bun.spawn = originalSpawn;
+    });
+
+    queue.push(sessionStatus('first', 'busy'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    queue.push(sessionStatus('first', 'idle'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(statuses).toEqual(['done']);
+  });
+
   test('serializes status writes when event callbacks overlap', async () => {
     const commands: string[] = [];
     const applied: string[] = [];
     const completions: Array<() => void> = [];
-    const shell = (strings: TemplateStringsArray, status?: string) => {
-      const command = strings.reduce(
-        (result, part, index) => result + part + (index < strings.length - 1 ? status : ''),
-        '',
-      );
+    const originalSpawn = Bun.spawn;
+    Bun.spawn = ((args: string[]) => {
+      if (args[1] === 'register-agent') return { exited: Promise.resolve(0) } as never;
+      const status = args[2];
+      commands.push(args.join(' '));
       return {
-        quiet: () => {
-          if (status === undefined) {
-            return Promise.resolve();
-          }
-          commands.push(command);
-          return new Promise<void>((resolve) => {
-            completions.push(() => {
-              applied.push(status);
-              resolve();
-            });
+        exited: new Promise<void>((resolve) => {
+          completions.push(() => {
+            if (status !== undefined) applied.push(status);
+            resolve();
           });
-        },
-      };
-    };
-    const hooks = await WorkmuxStatusPlugin({ $: shell } as never);
+        }),
+      } as never;
+    }) as never;
+    const queue = new EventQueue();
+    const cleanup = await WorkmuxStatusPlugin.setup({
+      event: { subscribe: ({ signal }: { signal: AbortSignal }) => queue.subscribe(signal) },
+    } as never);
+    cleanups.push(async () => {
+      cleanup?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      Bun.spawn = originalSpawn;
+    });
 
-    const busy = hooks.event?.({ event: sessionStatus('parent', 'busy') } as never);
-    const idle = hooks.event?.({ event: sessionStatus('parent', 'idle') } as never);
-    await Promise.resolve();
+    queue.push(sessionStatus('parent', 'busy'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    queue.push(sessionStatus('parent', 'idle'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(commands).toEqual(['workmux set-window-status working']);
 
     completions.shift()?.();
-    await busy;
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(commands).toEqual([
       'workmux set-window-status working',
       'workmux set-window-status done',
@@ -127,7 +210,7 @@ describe('WorkmuxStatusPlugin', () => {
     expect(applied).toEqual(['working']);
 
     completions.shift()?.();
-    await idle;
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(applied).toEqual(['working', 'done']);
   });
 
@@ -219,6 +302,22 @@ describe('WorkmuxStatusPlugin', () => {
       type: 'question.replied',
       properties: { sessionID: 'child' },
     });
+    expect(harness.statuses).toEqual(['working', 'waiting', 'working']);
+  });
+
+  test('reports waiting for permission requests and working after reply', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit({
+      type: 'permission.asked',
+      properties: { sessionID: 'child' },
+    });
+    await harness.emit({
+      type: 'permission.replied',
+      properties: { sessionID: 'child' },
+    });
+
     expect(harness.statuses).toEqual(['working', 'waiting', 'working']);
   });
 });
