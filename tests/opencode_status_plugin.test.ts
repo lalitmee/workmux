@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
 import { WorkmuxStatusPlugin } from '../resources/opencode/plugins/workmux-status';
+import WorkmuxDirectoryPlugin from '../resources/opencode/index.js';
 
 class EventQueue {
   private values: unknown[] = [];
@@ -87,6 +88,11 @@ describe('WorkmuxStatusPlugin', () => {
   test('exports a stable V2 plugin definition', () => {
     expect(WorkmuxStatusPlugin.id).toBe('workmux-status');
     expect(typeof WorkmuxStatusPlugin.setup).toBe('function');
+  });
+
+  test('directory entrypoint exposes the OpenCode V2 plugin', () => {
+    expect(WorkmuxDirectoryPlugin.id).toBe('workmux-status');
+    expect(typeof WorkmuxDirectoryPlugin.setup).toBe('function');
   });
 
   test('awaits registration during initialization before status handling', async () => {
